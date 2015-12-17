@@ -1,0 +1,343 @@
+'LS Recompile: 
+
+Option Public
+Option Explicit
+
+%REM
+An example of using Notes API calls to recompile LotusScript.
+
+version 1.0
+Julian Robichaux
+http://www.nsftools.com
+%END REM
+
+
+'** Notes C-API functions
+Declare Function OSPathNetConstruct Lib "nnotes.dll" (Byval portName As Integer, _
+Byval serverName As String, Byval fileName As String, Byval pathName As String) As Integer
+
+Declare Function NSFDbOpen Lib "nnotes.dll" (Byval dbName As String, hDb As Long) As Integer
+Declare Function NSFDbClose Lib "nnotes.dll" (Byval hDb As Long) As Integer
+
+Declare Function NSFNoteLSCompile Lib "nnotes.dll" (Byval hDb As Long, _
+Byval hNote As Long, Byval dwFlags As Long) As Integer
+Declare Function NSFNoteSign Lib "nnotes.dll" (Byval hNote As Long) As Integer
+Declare Function NSFNoteUpdate Lib "nnotes.dll" (Byval hNote As Long, _
+Byval flags As Integer) As Integer
+
+Declare Function OSLoadString Lib "nnotes.dll" (Byval hModule As Long, Byval stringCode As Integer, _
+Byval retBuffer As String, Byval bufferLength As Integer) As Integer
+
+
+'================================================================
+' Base class for working with Notes databases at the API level
+'================================================================
+Class APIBaseClass
+	Private db As NotesDatabase
+	Private hDb As Long
+	Private lastError As String
+	
+	
+	Public Sub New ()
+		'** nothing to instantiate in the base class
+	End Sub
+	
+	
+	Public Sub Delete ()
+		Call CloseDatabase()
+	End Sub
+	
+	
+	Public Function OpenDatabase (db As NotesDatabase) As Integer
+		On Error Goto processError
+		
+		If (hDb > 0) Then
+			Call CloseDatabase()
+		End If
+		
+		'** reset the internals
+		Set Me.db = db
+		lastError = ""
+		
+		Dim pathName As String*256
+		Dim result As Integer
+		
+		'** create a proper network path name with OSPathNetConstruct
+		Call OSPathNetConstruct(0, db.Server, db.FilePath, pathName)
+		
+		'** open the database and get a handle with NSFDbOpen
+		result = NSFDbOpen(pathName, hDb)
+		If result = 0 Then
+			OpenDatabase = True
+		Else
+			Call SetLastError("Cannot open database " & db.FilePath & " on server " & db.Server, result)
+		End If
+		
+		Exit Function
+		
+processError:
+		Call SetLastError("Error opening database", 0)
+		Exit Function
+		
+	End Function
+	
+	
+	Public Sub CloseDatabase ()
+		On Error Resume Next
+		
+		If (hDb > 0) Then
+			Call NSFDbClose(hDb)
+		End If
+		
+		Set db = Nothing
+		hDb = 0
+		lastError = ""
+	End Sub
+	
+	
+	Private Function SetLastError (errText As String, apiResultCode As Integer) As String
+		If (apiResultCode <> 0) Then
+			LastError = "API Error " & apiResultCode & ": " & GetAPIError(apiResultCode)
+		Elseif (Err > 0) Then
+			LastError = "Notes Error " & Err & ": " & Error$
+		Else
+			LastError = ""
+		End If
+		
+		If (Len(errText) > 0) Then
+			LastError = errText & ". " & LastError
+		End If
+	End Function
+	
+	
+	Public Function GetLastError () As String
+		GetLastError = LastError
+	End Function
+	
+	
+	Public Function GetAPIError (errorCode As Integer) As String
+		Dim errorString As String*256
+		Dim returnErrorString As String
+		Dim resultStringLength As Long
+		Dim errorCodeTranslated As Integer
+		
+		Const ERR_MASK = &H3fff
+		Const PKG_MASK = &H3f00
+		Const ERRNUM_MASK = &H00ff
+		
+		'** mask off the top 2 bits of the errorCode that was returned; this is
+		'** what the ERR macro in the API does
+		errorCodeTranslated = (errorCode And ERR_MASK)
+		
+		'** get the error code translation using the OSLoadString API function
+		resultStringLength = OSLoadString(0, errorCodeTranslated, errorString, Len(errorString) - 1)
+		
+		'** strip off the null-termination on the string before you return it
+		If (Instr(errorString, Chr(0)) > 0) Then
+			returnErrorString = Left$(errorString, Instr(errorString, Chr(0)) - 1)
+		Else
+			returnErrorString = errorString
+		End If
+		
+		GetAPIError = returnErrorString
+		
+	End Function
+	
+End Class
+
+
+'================================================================
+' Special subclass for recompiling a note/doc in a database
+'================================================================
+Class LotusScriptRecompiler As APIBaseClass
+	
+	Public Function RecompileLSByNoteID (noteID As String) As Integer
+		On Error Goto processError
+		
+		If (db Is Nothing) Then
+			Call SetLastError("Database is not open", 0)
+			Exit Function
+		End If
+		
+		Dim doc As NotesDocument
+		Set doc = db.GetDocumentByID(noteID)
+		RecompileLSByNoteID = RecompileLS(doc)
+		Exit Function
+		
+processError:
+		Call SetLastError("Error recompiling LotusScript for " & noteID, 0)
+		Exit Function
+		
+	End Function
+	
+	
+	Public Function RecompileLSByUNID (unid As String) As Integer
+		On Error Goto processError
+		
+		If (db Is Nothing) Then
+			Call SetLastError("Database is not open", 0)
+			Exit Function
+		End If
+		
+		Dim doc As NotesDocument
+		Set doc = db.GetDocumentByUNID(unid)
+		RecompileLSByUNID = RecompileLS(doc)
+		Exit Function
+		
+processError:
+		Call SetLastError("Error recompiling LotusScript for " & unid, 0)
+		Exit Function
+		
+	End Function
+	
+	
+	Public Function RecompileLS (doc As NotesDocument) As Integer
+		On Error Goto processError
+		
+		Dim hNote As Long
+		Dim unid As String
+		Dim result As Integer
+		
+		If (hDb = 0) Then
+			Call SetLastError("Database is not open", 0)
+			Exit Function
+		Elseif (doc Is Nothing) Then
+			Call SetLastError("Invalid document reference", 0)
+			Exit Function
+		End If
+		
+		'** super-special-secret way of getting an API handle to a NotesDocument
+		hNote = doc.Handle
+		unid = doc.UniversalID
+		
+		'** first, we compile the note
+		result = NSFNoteLSCompile(hDb, hNote, 0)
+		If (result <> 0) Then
+			Call SetLastError("Cannot compile LotusScript for " & GetTitle(doc), result)
+			Exit Function
+		End If
+		
+		'** then we sign it
+		result = NSFNoteSign(hNote)
+		If (result <> 0) Then
+			Call SetLastError("Cannot sign " & GetTitle(doc), result)
+			Exit Function
+		End If
+		
+		'** then we save it
+		result = NSFNoteUpdate(hNote, 0)
+		If (result <> 0) Then
+			Call SetLastError("Cannot save " & GetTitle(doc), result)
+			Exit Function
+		End If
+		
+		'** update the in-memory reference to the object
+		Delete doc
+		Set doc = db.GetDocumentByUNID(unid)
+		
+		'** a little trick to avoid this message on recompiled forms:
+		'** This document has been altered since the last time it was signed! Intentional tampering may have occurred.
+		Call doc.Sign()
+		Call doc.Save(True, False)
+		
+		lastError = ""
+		RecompileLS = True
+		Exit Function
+		
+processError:
+		Call SetLastError("Error recompiling LotusScript for " & GetTitle(doc), 0)
+		Exit Function
+		
+	End Function
+	
+	
+	Public Function GetTitle (doc As NotesDocument) As String
+		On Error Resume Next
+		If (doc Is Nothing) Then
+			Exit Function
+		End If
+		
+		Dim title As String
+		title = doc.~$Title(0)
+		If (Instr(title, "|") > 0) Then
+			title = Strleft(title, "|")
+		End If
+		
+		If (title = "") Then
+			title = "(untitled)"
+		End If
+		
+		GetTitle = |"| & title & |"|
+	End Function
+End Class
+
+
+
+Sub Initialize
+	'** As a test, let's recompile all the agents, script libraries, and forms
+	'** in this database
+	Dim session As New NotesSession
+	Dim db As NotesDatabase
+	Dim nc As NotesNoteCollection
+	Dim recompiler As New LotusScriptRecompiler
+	Dim noteID As String
+	
+	'** create our recompiler object
+	Set db = session.CurrentDatabase
+	Call recompiler.OpenDatabase(db)
+	If (recompiler.GetLastError <> "") Then
+		Print recompiler.GetLastError
+		Exit Sub
+	End If
+	
+	'** compile the script libraries first (note that this will NOT build a
+	'** dependency tree -- rather, we'll try to brute-force around the 
+	'** dependencies by recompiling until either (A) there are no errors,
+	'** or (B) the number of errors we get is the same as we got last time)
+	Dim errCount As Integer, lastCount As Integer
+	Set nc = db.CreateNoteCollection(False)
+	nc.SelectScriptLibraries = True
+	Call nc.BuildCollection
+	
+	Print "SCRIPT LIBRARIES"
+	Do
+		lastCount = errCount
+		errCount = 0
+		
+		noteID = nc.GetFirstNoteId
+		Do Until (noteID = "")
+			If recompiler.RecompileLSByNoteID(noteID) Then
+				Print "Successfully recompiled " & _
+				recompiler.GetTitle(db.GetDocumentByID(noteID))
+			Else
+				Print recompiler.GetLastError
+				errCount = errCount + 1
+			End If
+			
+			noteID = nc.GetNextNoteId(noteID)
+		Loop
+	Loop Until ( (errCount = 0) Or (errCount = lastCount) )
+	
+	'** then compile everything else
+	Set nc = db.CreateNoteCollection(False)
+	nc.SelectAgents = True
+	nc.SelectForms = True
+	Call nc.BuildCollection
+	
+	Print "FORMS AND AGENTS"
+	noteID = nc.GetFirstNoteId
+	Do Until (noteID = "")
+		If recompiler.RecompileLSByNoteID(noteID) Then
+			Print "Successfully recompiled " & _
+			recompiler.GetTitle(db.GetDocumentByID(noteID))
+		Else
+			Print recompiler.GetLastError
+		End If
+		
+		noteID = nc.GetNextNoteId(noteID)
+	Loop
+	
+	Call recompiler.CloseDatabase()
+	Print "All done"
+End Sub
+
